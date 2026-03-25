@@ -18,6 +18,7 @@
 #
 """Wrapper generation utils for IREE backends."""
 
+import re
 from typing import Optional
 
 from mlonmcu.logging import get_logger
@@ -25,6 +26,11 @@ from mlonmcu.flow.tvm.backend.wrapper import getSizes
 from .iree_utils import parse_iree_version
 
 logger = get_logger()
+
+
+def _to_c_identifier(value: str) -> str:
+    """Convert a generated artifact stem into a valid C identifier fragment."""
+    return re.sub(r"[^0-9A-Za-z_]", "_", value)
 
 
 def writeTensors(in_tensors, out_tensors):
@@ -308,7 +314,12 @@ iree_status_t create_sample_device(iree_allocator_t host_allocator,
     return sync
 
 
-def generate_wrapper(model_info, main_func_name: str, iree_version: Optional[str] = None):
+def generate_wrapper(
+    model_info,
+    main_func_name: str,
+    iree_version: Optional[str] = None,
+    enable_abft: bool = False,
+):
     """Generate IREE wrapper code (source)."""
     inSizes = getSizes(model_info.in_tensors)
     outSizes = getSizes(model_info.out_tensors)
@@ -333,6 +344,14 @@ def generate_wrapper(model_info, main_func_name: str, iree_version: Optional[str
 #include "iree/modules/hal/module.h"
 #include "iree/modules/hal/inline/module.h"
 #include "iree/modules/hal/loader/module.h"
+"""
+        + (
+            """#include "iree/modules/abft_analysis/module.h"
+"""
+            if enable_abft
+            else ""
+        )
+        + """
 #include "iree/vm/api.h"
 #include "iree/vm/bytecode/module.h"
 
@@ -400,13 +419,27 @@ iree_status_t Prepare(void) {
   IREE_RETURN_IF_ERROR(create_module(instance, &module));
   // printf("E\\n");
 
+"""
+        + (
+            """
+  iree_vm_module_t* abft_module = NULL;
+  IREE_RETURN_IF_ERROR(iree_abft_analysis_module_create(
+      instance, iree_allocator_system(), &abft_module));
+"""
+            if enable_abft
+            else ""
+        )
+        + """
+
   // iree_vm_module_t *hal_module = NULL;
   // IREE_RETURN_IF_ERROR(iree_hal_module_create(
   //     instance, /*device_count=*/1, &device, IREE_HAL_MODULE_FLAG_SYNCHRONOUS,
   //     iree_hal_module_debug_sink_stdio(stderr), iree_allocator_system(),
   //     &hal_module));
 #if defined(BUILD_INLINE_HAL)
-  iree_vm_module_t* modules[] = {hal_inline_module, module};
+  iree_vm_module_t* modules[] = {hal_inline_module, """
+        + ("abft_module, " if enable_abft else "")
+        + """module};
 #elif defined(BUILD_LOADER_HAL)
   // Create hal_loader_module
   iree_vm_module_t* hal_loader_module = NULL;
@@ -414,7 +447,9 @@ iree_status_t Prepare(void) {
       instance, IREE_HAL_MODULE_FLAG_NONE,
       /*loader_count=*/1, &loader, iree_allocator_system(),
       &hal_loader_module));
-  iree_vm_module_t* modules[] = {hal_inline_module, hal_loader_module, module};
+  iree_vm_module_t* modules[] = {hal_inline_module, hal_loader_module, """
+        + ("abft_module, " if enable_abft else "")
+        + """module};
 #else
   // Create hal_module
   iree_vm_module_t* hal_module = NULL;
@@ -425,7 +460,9 @@ iree_status_t Prepare(void) {
       iree_hal_module_debug_sink_stdio(stderr), iree_allocator_system(),
       &hal_module));
 
-  iree_vm_module_t* modules[] = {hal_module, module};
+  iree_vm_module_t* modules[] = {hal_module, """
+        + ("abft_module, " if enable_abft else "")
+        + """module};
 #endif
   iree_hal_executable_loader_release(loader);
   // printf("F\\n");
@@ -447,6 +484,15 @@ iree_status_t Prepare(void) {
 #if defined(BUILD_LOADER_HAL)
   iree_vm_module_release(hal_loader_module);
 #endif
+"""
+        + (
+            """
+  iree_vm_module_release(abft_module);
+"""
+            if enable_abft
+            else ""
+        )
+        + """
   iree_vm_module_release(module);
   // printf("I\\n");
 
@@ -613,15 +659,25 @@ def generate_iree_wrapper(
     vmvx: bool = False,
     translated: bool = False,
     iree_version: Optional[str] = None,
+    enable_abft: bool = False,
+    linked_identifier: Optional[str] = None,
 ):
     """Generate IREE wrapper codes (source, header, device_sync, utils)."""
 
     logger.debug("Generating IREE wrapper...")
     main_func_name = model_info.main_func_name
     assert main_func_name is not None
-    identifier2 = f"{identifier}_linked" if translated else f"{main_func_name}_dispatch_0"
+    if linked_identifier is None:
+        linked_identifier = identifier
+    linked_identifier = _to_c_identifier(linked_identifier)
+    identifier2 = f"{linked_identifier}_linked" if translated else f"{main_func_name}_dispatch_0"
 
-    wrapper = generate_wrapper(model_info, main_func_name, iree_version=iree_version)
+    wrapper = generate_wrapper(
+        model_info,
+        main_func_name,
+        iree_version=iree_version,
+        enable_abft=enable_abft,
+    )
     header = generate_header()
     sync = generate_sync(identifier, identifier2, vmvx)
     utils_ = generate_utils(identifier, use_emitc, vmvx, iree_version=iree_version)

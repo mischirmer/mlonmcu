@@ -26,9 +26,9 @@ logger = get_logger()
 
 def parse_iree_version(iree_version: Optional[str] = None):
     if iree_version is None:
-        logger.warning("iree.version undefined, assuming v3.3")
+        logger.warning("iree.version undefined, assuming v3.1")
         major = 3
-        minor = 3
+        minor = 1
     else:
         major, minor = map(int, iree_version.split(".", 1))
     return major, minor

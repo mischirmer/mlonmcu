@@ -131,6 +131,13 @@ class IREEBackend(Backend):
     DEFAULTS = {
         "print_outputs": False,
         "opt_level": None,
+        "compiler_mode": "baseline",
+        "abft_enable_fuc": False,
+        "freivalds_scaling_mode": "binary",
+        "freivalds_num_checks": 1,
+        "freivalds_enable_analysis": True,
+        "abft_enable_matmul_tiling": True,
+        "abft_enable_analysis": True,
         "target_cpu": None,
         "target_triple": None,
         "target_abi": None,
@@ -147,7 +154,37 @@ class IREEBackend(Backend):
 
     REQUIRED = {"iree.install_dir", "iree.src_dir"}
 
+    CONFIG_ALIASES = {
+        "iree",
+        "ireevmvx",
+        "ireevmvx_inline",
+        "ireellvm",
+        "ireellvm_inline",
+        "ireellvmc",
+        "ireellvmc_inline",
+    }
+
+    @classmethod
+    def normalize_config(cls, name, config):
+        if not config:
+            return config
+
+        normalized = dict(config)
+        shared_keys = set(cls.DEFAULTS.keys())
+        for alias in cls.CONFIG_ALIASES:
+            if alias == name:
+                continue
+            for key in shared_keys:
+                alias_key = f"{alias}.{key}"
+                own_key = f"{name}.{key}"
+                if alias_key not in normalized or own_key in normalized:
+                    continue
+                logger.warning("Treating config key '%s' as '%s' for backend '%s'", alias_key, own_key, name)
+                normalized[own_key] = normalized[alias_key]
+        return normalized
+
     def __init__(self, output_format=None, hal_backend=None, hal_inline=False, features=None, config=None):
+        config = self.normalize_config(type(self).name, config)
         super().__init__(framework="iree", features=features, config=config)
         self.identifier = "model"
         assert output_format in ["vm-bytecode", "vm-c"]
@@ -201,6 +238,12 @@ class IREEBackend(Backend):
         return self.config["opt_level"]
 
     @property
+    def compiler_mode(self):
+        value = self.config["compiler_mode"]
+        assert value in ["baseline", "abft", "abyzft", "freivald", "freivalds"], f"Unsupported compiler mode: {value}"
+        return value
+
+    @property
     def iree_compile_extra_args(self):
         return self.config["iree_compile_extra_args"]
 
@@ -220,12 +263,21 @@ class IREEBackend(Backend):
         return self.config["iree.src_dir"]
 
     @property
+    def iree_tools_dir(self):
+        iree_build_dir = self.iree_build_dir
+        if iree_build_dir is not None:
+            build_tools_dir = iree_build_dir / "tools"
+            if build_tools_dir.is_dir():
+                return build_tools_dir
+        return Path(self.iree_install_dir) / "bin"
+
+    @property
     def iree_compile_exe(self):
-        return Path(self.iree_install_dir) / "bin" / "iree-compile"
+        return self.iree_tools_dir / "iree-compile"
 
     @property
     def iree_c_embed_data_exe(self):
-        return Path(self.iree_install_dir) / "bin" / "iree-c-embed-data"
+        return self.iree_tools_dir / "iree-c-embed-data"
 
     @property
     def mlir_opt_exe_fallback(self):
@@ -235,7 +287,7 @@ class IREEBackend(Backend):
 
     @property
     def mlir_opt_exe(self):
-        return self.iree_install_dir / "bin" / "mlir-opt"
+        return self.iree_tools_dir / "iree-opt"
 
     @property
     def iree_tflite_path(self):
@@ -260,7 +312,14 @@ class IREEBackend(Backend):
         pythonpath = f"{self.iree_tflite_path}:{self.iree_tf_path}:{pythonpath}"
         env["PYTHONPATH"] = pythonpath
         old_path = env.get("PATH", "")
-        new_path = f"{self.iree_install_dir}/bin:{old_path}"
+        extra_paths = []
+        iree_build_dir = self.iree_build_dir
+        if iree_build_dir is not None:
+            build_tools_dir = iree_build_dir / "tools"
+            if build_tools_dir.is_dir():
+                extra_paths.append(str(build_tools_dir))
+        extra_paths.append(f"{self.iree_install_dir}/bin")
+        new_path = f"{':'.join(extra_paths)}:{old_path}"
         env["PATH"] = new_path
         return env
 
@@ -316,10 +375,90 @@ class IREEBackend(Backend):
     def loop_unroll(self):
         return str2bool(self.config["loop_unroll"], allow_none=True)
 
-    def get_iree_compile_args(self, out, model_path):
+    @property
+    def abft_enable_matmul_tiling(self):
+        return str2bool(self.config["abft_enable_matmul_tiling"])
+
+    @property
+    def abft_enable_fuc(self):
+        return str2bool(self.config["abft_enable_fuc"])
+
+    @property
+    def freivalds_scaling_mode(self):
+        value = self.config["freivalds_scaling_mode"]
+        assert value in ["binary", "standard"], f"Unsupported freivalds scaling mode: {value}"
+        return value
+
+    @property
+    def freivalds_enable_analysis(self):
+        return str2bool(self.config["freivalds_enable_analysis"])
+
+    @property
+    def freivalds_num_checks(self):
+        value = int(self.config["freivalds_num_checks"])
+        assert value >= 1, "freivalds_num_checks must be >= 1"
+        return value
+
+    @property
+    def effective_freivalds_enable_analysis(self):
+        # vm-c/emitc path used by MLonMCU does not always link the ABFT
+        # analysis runtime module symbol (iree_abft_analysis_module_create).
+        # Keep external analysis wiring disabled there.
+        if self.use_emitc:
+            return False
+        return self.freivalds_enable_analysis
+
+    @property
+    def requires_partitioned_freivalds(self):
+        return self.compiler_mode in ["freivald", "freivalds"]
+
+    @property
+    def abft_enable_analysis(self):
+        return str2bool(self.config["abft_enable_analysis"])
+
+    def get_iree_opt_instrument_args(self):
+        if self.compiler_mode == "baseline":
+            return []
+        if self.compiler_mode == "abft":
+            return [
+                "--iree-plugin=abft_pass",
+                "--pass-pipeline=builtin.module(func.func(abft-insert-ones))",
+                *(["--abft-enable-fuc"] if self.abft_enable_fuc else []),
+                "--mlir-disable-threading",
+            ]
+        if self.compiler_mode == "abyzft":
+            return [
+                "--iree-plugin=abyzft_pass",
+                "--pass-pipeline=builtin.module(abyzft-insert-scale-descal)",
+                "--mlir-disable-threading",
+            ]
+        if self.compiler_mode in ["freivald", "freivalds"]:
+            return [
+                "--iree-plugin=freivalds_pass",
+                "--pass-pipeline=builtin.module(func.func(freivalds-insert-ones))",
+                f"--freivalds-scaling-mode={self.freivalds_scaling_mode}",
+                f"--freivalds-num-checks={self.freivalds_num_checks}",
+                *(
+                    []
+                    if self.effective_freivalds_enable_analysis
+                    else ["--freivalds-enable-analysis-log=false"]
+                ),
+                "--mlir-disable-threading",
+            ]
+        raise RuntimeError(f"Unhandled compiler mode: {self.compiler_mode}")
+
+    def get_iree_compile_mode_args(self):
+        # Instrumentation is applied explicitly via iree-opt before iree-compile.
+        return []
+
+    def get_iree_compile_args(self, out, model_path, include_mode_args=True):
         static_lib_path = out.parent / f"{self.identifier}_static_lib.o"
+        model_path = Path(model_path)
+        is_instrumented_mlir = ".instrumented" in model_path.name and model_path.suffix == ".mlir"
         args = [
             model_path,
+            *(["--iree-input-type=none"] if is_instrumented_mlir else []),
+            *(["--iree-opt-const-expr-hoisting=false"] if is_instrumented_mlir else []),
             # TODO: use true/false
             *(
                 [f"--iree-opt-strip-assertions={int(self.strip_assertions)}"]
@@ -355,6 +494,8 @@ class IREEBackend(Backend):
                 if self.hal_backend == "llvm-cpu"
                 else []
             ),
+            *(["--mlir-disable-threading"] if is_instrumented_mlir else []),
+            *(self.get_iree_compile_mode_args() if include_mode_args else []),
             # "--iree-stream-partitioning-favor=min-peak-memory",  # TODO: expose & check
             # *get_target_tvmc_args(
             #     self.target,
@@ -380,8 +521,8 @@ class IREEBackend(Backend):
     def invoke_iree(self, exe, *args, cwd=None, **kwargs):
         return utils.execute(exe, *args, live=self.print_outputs, cwd=cwd, **kwargs)
 
-    def invoke_iree_compile(self, out, model_path, cwd=None):
-        args = self.get_iree_compile_args(out, model_path)
+    def invoke_iree_compile(self, out, model_path, cwd=None, include_mode_args=True):
+        args = self.get_iree_compile_args(out, model_path, include_mode_args=include_mode_args)
         self.timeout_sec = 0
         if self.timeout_sec > 0:
             ret = exec_timeout(
@@ -394,6 +535,46 @@ class IREEBackend(Backend):
         else:
             ret = self.invoke_iree(self.iree_compile_exe, *args, cwd=cwd)
         return ret
+
+    def instrument_mlir(self, input_mlir_path, output_mlir_path, cwd=None):
+        iree_opt_exe = self.mlir_opt_exe
+        if not iree_opt_exe.is_file():
+            iree_opt_exe = self.mlir_opt_exe
+        assert iree_opt_exe.is_file(), f"Missing file: {iree_opt_exe}"
+        args = [
+            input_mlir_path,
+            "-o",
+            output_mlir_path,
+            *self.get_iree_opt_instrument_args(),
+        ]
+        self.timeout_sec = 0
+        if self.timeout_sec > 0:
+            ret = exec_timeout(
+                self.timeout_sec,
+                self.invoke_iree,
+                iree_opt_exe,
+                *args,
+                cwd=cwd,
+            )
+        else:
+            ret = self.invoke_iree(iree_opt_exe, *args, cwd=cwd)
+        return ret
+
+    def strip_abft_analysis_calls(self, input_mlir_path, output_mlir_path):
+        with open(input_mlir_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        filtered = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("func.func private @abft_analysis."):
+                continue
+            if "call @abft_analysis." in stripped:
+                continue
+            filtered.append(line)
+
+        with open(output_mlir_path, "w", encoding="utf-8") as f:
+            f.writelines(filtered)
 
     def translate_mlirbc_to_mlir(self, mlirbc_path, mlir_path, cwd=None):
         args = [
@@ -430,6 +611,45 @@ class IREEBackend(Backend):
         else:
             ret = self.invoke_iree(self.iree_c_embed_data_exe, *args, cwd=cwd)
         return ret
+
+    def invoke_iree_opt(self, *args, cwd=None):
+        iree_opt_exe = self.mlir_opt_exe
+        if not iree_opt_exe.is_file():
+            iree_opt_exe = self.mlir_opt_exe
+        assert iree_opt_exe.is_file(), f"Missing file: {iree_opt_exe}"
+        return self.invoke_iree(iree_opt_exe, *args, cwd=cwd)
+
+    def preprocess_conv2d_to_img2col(self, input_mlir_path, output_mlir_path, cwd=None):
+        args = [
+            input_mlir_path,
+            "--iree-preprocessing-convert-conv2d-to-img2col",
+            "-o",
+            output_mlir_path,
+        ]
+        return self.invoke_iree_opt(*args, cwd=cwd)
+
+    def rewrite_util_funcs_to_func(self, input_mlir_path, output_mlir_path):
+        text = Path(input_mlir_path).read_text()
+        text = text.replace("util.func", "func.func")
+        text = text.replace("util.call", "func.call")
+        text = text.replace("util.return", "func.return")
+        Path(output_mlir_path).write_text(text)
+
+    def get_matmul_transform_lib(self):
+        return Path(self.iree_src_dir) / "samples" / "models" / "matmul" / "matmul_tile_4x4x4_transform.mlir"
+
+    def tile_matmuls(self, input_mlir_path, output_mlir_path, cwd=None):
+        transform_lib = self.get_matmul_transform_lib()
+        assert transform_lib.is_file(), f"Missing file: {transform_lib}"
+        args = [
+            input_mlir_path,
+            f"--transform-preload-library=transform-library-paths={transform_lib}",
+            "--transform-interpreter",
+            "--canonicalize",
+            "-o",
+            output_mlir_path,
+        ]
+        return self.invoke_iree_opt(*args, cwd=cwd)
 
     def load_model(
         self, model, input_shapes=None, output_shapes=None, input_types=None, output_types=None, params_path=None
@@ -631,11 +851,82 @@ class IREEBackend(Backend):
                     )
                 # model_path = mlirbc_path
             model_path = mlir_path
+            out = ""
+            if self.compiler_mode != "baseline":
+                img2col_mlir_path = out_dir / f"{self.identifier}.img2col.mlir"
+                instrumentable_mlir_path = out_dir / f"{self.identifier}.instrumentable.mlir"
+                tiled_mlir_path = out_dir / f"{self.identifier}.tiled.mlir"
+                instrumented_mlir_path = out_dir / f"{self.identifier}.instrumented.mlir"
+
+                out += self.preprocess_conv2d_to_img2col(model_path, img2col_mlir_path, cwd=temp_dir)
+                with open(img2col_mlir_path, "r") as f:
+                    img2col_mlir_content = f.read()
+                artifacts.append(
+                    Artifact(
+                        img2col_mlir_path.name,
+                        content=img2col_mlir_content,
+                        fmt=ArtifactFormat.SOURCE,
+                    )
+                )
+
+                self.rewrite_util_funcs_to_func(img2col_mlir_path, instrumentable_mlir_path)
+                with open(instrumentable_mlir_path, "r") as f:
+                    instrumentable_mlir_content = f.read()
+                artifacts.append(
+                    Artifact(
+                        instrumentable_mlir_path.name,
+                        content=instrumentable_mlir_content,
+                        fmt=ArtifactFormat.SOURCE,
+                    )
+                )
+
+                abft_input_mlir_path = instrumentable_mlir_path
+                if self.abft_enable_matmul_tiling:
+                    out += self.tile_matmuls(instrumentable_mlir_path, tiled_mlir_path, cwd=temp_dir)
+                    with open(tiled_mlir_path, "r") as f:
+                        tiled_mlir_content = f.read()
+                    artifacts.append(
+                        Artifact(
+                            tiled_mlir_path.name,
+                            content=tiled_mlir_content,
+                            fmt=ArtifactFormat.SOURCE,
+                        )
+                    )
+                    abft_input_mlir_path = tiled_mlir_path
+
+                if self.requires_partitioned_freivalds:
+                    if not self.abft_enable_matmul_tiling:
+                        raise RuntimeError(
+                            "Freivalds requires matmul tiling/partitioning before instrumentation. "
+                            "Set ireellvmc.abft_enable_matmul_tiling=true."
+                        )
+                    if abft_input_mlir_path != tiled_mlir_path:
+                        raise RuntimeError(
+                            f"Freivalds must instrument the tiled MLIR, but got: {abft_input_mlir_path}"
+                        )
+                out += self.instrument_mlir(abft_input_mlir_path, instrumented_mlir_path, cwd=temp_dir)
+                if (
+                    self.compiler_mode not in ["freivald", "freivalds"]
+                    and not self.abft_enable_analysis
+                ):
+                    stripped_instrumented_mlir_path = out_dir / f"{self.identifier}.instrumented.no_analysis.mlir"
+                    self.strip_abft_analysis_calls(instrumented_mlir_path, stripped_instrumented_mlir_path)
+                    instrumented_mlir_path = stripped_instrumented_mlir_path
+                with open(instrumented_mlir_path, "r") as f:
+                    instrumented_mlir_content = f.read()
+                artifacts.append(
+                    Artifact(
+                        instrumented_mlir_path.name,
+                        content=instrumented_mlir_content,
+                        fmt=ArtifactFormat.SOURCE,
+                    )
+                )
+                model_path = instrumented_mlir_path
             if self.output_format == "vm-bytecode":
                 out_path = out_dir / f"{self.identifier}.vmfb"
             elif self.output_format == "vm-c":
                 out_path = out_dir / f"{self.identifier}_emitc.h"
-            out = self.invoke_iree_compile(out_path, model_path, cwd=temp_dir)
+            out += self.invoke_iree_compile(out_path, model_path, cwd=temp_dir, include_mode_args=False)
             if self.hal_backend == "llvm-cpu":
                 static_lib_path = out_dir / f"{self.identifier}_static_lib.o"
                 header_path = out_dir / f"{self.identifier}_static_lib.h"
@@ -706,6 +997,11 @@ class IREEBackend(Backend):
                         fmt=ArtifactFormat.SOURCE,
                     )
                 )
+            # If analysis imports were stripped from instrumented MLIR, the
+            # wrapper must not wire the abft_analysis runtime module.
+            analysis_calls_stripped = (
+                model_path.suffix == ".mlir" and ".no_analysis" in model_path.name
+            )
             wrapper_content, wrapper_header_content, sync_content, utils_content = generate_iree_wrapper(
                 model_info,
                 self.identifier,
@@ -713,6 +1009,17 @@ class IREEBackend(Backend):
                 vmvx=self.hal_backend in ["vmvx", "vmvx-inline"],
                 translated=translated,
                 iree_version=self.iree_version,
+                enable_abft=(
+                    not analysis_calls_stripped
+                    and not self.use_emitc
+                    and self.compiler_mode != "baseline"
+                    and (
+                        self.effective_freivalds_enable_analysis
+                        if self.compiler_mode in ["freivald", "freivalds"]
+                        else self.abft_enable_analysis
+                    )
+                ),
+                linked_identifier=Path(model_path).stem,
             )
             artifacts.append(
                 Artifact(

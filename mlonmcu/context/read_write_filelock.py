@@ -228,7 +228,7 @@ class WriteFileLock:
         # 3. check if the lock is already occupied by another process
         occupied = False
         for k, v in lock_occupy_info.items():
-            if v["type"] == "write" or "read":
+            if v["type"] in ("write", "read"):
                 occupied = True
                 break
 

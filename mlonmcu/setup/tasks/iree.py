@@ -21,7 +21,7 @@
 import shutil
 import multiprocessing
 
-# from pathlib import Path
+from pathlib import Path
 
 from mlonmcu.setup.task import TaskType
 from mlonmcu.context.context import MlonMcuContext
@@ -155,8 +155,8 @@ def install_iree(
     user_vars = context.environment.vars
     if "iree.install_dir" in user_vars:
         return False
-    ireeBuildDir = context.cache["iree.build_dir"]
-    ireeInstallDir = context.cache["iree.install_dir"]
+    ireeBuildDir = Path(context.cache["iree.build_dir"])
+    ireeInstallDir = Path(context.cache["iree.install_dir"])
     if rebuild or not utils.is_populated(ireeInstallDir):
         ninja = True
         utils.make("install", cwd=ireeBuildDir, threads=threads, use_ninja=ninja, live=verbose)
