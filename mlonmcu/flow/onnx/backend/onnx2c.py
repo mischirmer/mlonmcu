@@ -28,6 +28,7 @@ from mlonmcu.artifact import Artifact, ArtifactFormat
 from mlonmcu.config import str2bool, str2dict
 from mlonmcu.flow.backend import main
 from mlonmcu.logging import get_logger
+from mlonmcu.target.metrics import Metrics
 
 from .backend import ONNXBackend
 
@@ -47,8 +48,12 @@ class Onnx2CBackend(ONNXBackend):
         "extern_init": False,
         "only_init": False,
         "avr": False,
+        "conv_im2col": True,
         "optimizations": None,
         "define": {},
+        "protection": "baseline",
+        "freivalds_checks": 1,
+        "abft_weight_checksums_compiletime": True,
         "sanitize_legacy_broadcast_attrs": True,
         "sanitized_model_out": None,
     }
@@ -84,6 +89,10 @@ class Onnx2CBackend(ONNXBackend):
         return str2bool(self.config["avr"])
 
     @property
+    def conv_im2col(self):
+        return str2bool(self.config["conv_im2col"])
+
+    @property
     def optimizations(self):
         return self.config["optimizations"]
 
@@ -94,6 +103,18 @@ class Onnx2CBackend(ONNXBackend):
             value = str2dict(value)
         assert isinstance(value, dict)
         return value
+
+    @property
+    def protection(self):
+        return str(self.config["protection"]).lower()
+
+    @property
+    def freivalds_checks(self):
+        return int(self.config["freivalds_checks"])
+
+    @property
+    def abft_weight_checksums_compiletime(self):
+        return str2bool(self.config["abft_weight_checksums_compiletime"])
 
     @property
     def sanitize_legacy_broadcast_attrs(self):
@@ -497,6 +518,7 @@ int mlonmcu_check() {{
     def generate(self) -> Tuple[dict, dict]:
         assert self.model is not None
         artifacts = []
+        metrics = Metrics()
         onnx2c_exe = self.config["onnx2c.exe"]
 
         base_name = Path(self.model).stem
@@ -515,6 +537,8 @@ int mlonmcu_check() {{
                 args.append("--extern-init")
             if self.only_init:
                 args.append("--only-init")
+            if self.conv_im2col:
+                args.append("--conv-im2col")
 
             args.extend(["--log", str(self.log_level)])
             args.extend(["--func-name", self.func_name])
@@ -522,14 +546,78 @@ int mlonmcu_check() {{
             if self.optimizations:
                 args.extend(["--optimizations", str(self.optimizations)])
 
+            protection = self.protection
+            if protection == "baseline":
+                pass
+            elif protection == "abft":
+                args.append("--abft-gemm")
+            elif protection == "abyzft":
+                args.append("--abyzft-gemm")
+            elif protection == "freivalds":
+                if self.freivalds_checks < 1:
+                    raise RuntimeError("onnx2c.freivalds_checks must be >= 1")
+                args.append("--freivalds-gemm")
+                args.extend(["--freivalds-checks", str(self.freivalds_checks)])
+            else:
+                raise RuntimeError(
+                    "Unsupported onnx2c.protection value. Supported: baseline, abft, abyzft, freivalds"
+                )
+
+            if self.abft_weight_checksums_compiletime:
+                args.append("--abft-weight-checksums-compiletime")
+            else:
+                args.append("--abft-weight-checksums-runtime")
+
             for dim, size in self.define.items():
                 args.extend(["--define", f"{dim}:{size}"])
 
             args.append(str(model_to_use))
+            cmd_str = " ".join([str(onnx2c_exe)] + [str(arg) for arg in args])
 
-            out = utils.execute(onnx2c_exe, *args, live=self.print_outputs)
+            error_out = {"text": None}
+
+            def _onnx2c_err_func(msg):
+                text = msg if isinstance(msg, str) else str(msg)
+                error_out["text"] = text
+                lines = text.splitlines()
+                head = "\n".join(lines[:40])
+                tail = "\n".join(lines[-40:])
+                if len(lines) > 80:
+                    logger.error(
+                        "onnx2c failed. Showing first and last 40 lines (full output suppressed, %d lines total):\n%s\n...\n%s",
+                        len(lines),
+                        head,
+                        tail,
+                    )
+                else:
+                    logger.error("onnx2c failed. Output:\n%s", text)
+
+            try:
+                out = utils.execute(onnx2c_exe, *args, live=self.print_outputs, err_func=_onnx2c_err_func)
+            except AssertionError as err:
+                if error_out["text"] is not None:
+                    raise RuntimeError(
+                        "onnx2c code generation failed. Full generator output was suppressed to keep logs readable."
+                    ) from err
+                raise
             source_artifact = Artifact(f"{base_name}.c", content=out, fmt=ArtifactFormat.SOURCE)
             artifacts.append(source_artifact)
+            artifacts.append(Artifact("onnx2c_cmd.txt", content=cmd_str, fmt=ArtifactFormat.TEXT))
+
+            metrics.add("onnx2c ConvInteger im2col blocks", out.count("/* ConvInteger (im2col + dot-product) */"), True)
+            metrics.add("onnx2c QLinearConv im2col blocks", out.count("/* QLinearConv (im2col + dot-product) */"), True)
+            metrics.add("onnx2c ABFT verify blocks", out.count("/* ABFT verify"), True)
+            metrics.add("onnx2c Freivalds verify blocks", out.count("/* Freivalds verify"), True)
+            metrics.add("onnx2c AByzFT scaling blocks", out.count("/* AByzFT: randomized scaling"), True)
+            metrics.add("onnx2c Tampering increment sites", out.count("TAMPERING_DETECTIONS++"), True)
+            metrics.add("onnx2c Protection mode", repr(protection), True)
+            expected = {
+                "baseline": 0,
+                "abft": out.count("/* ABFT verify"),
+                "abyzft": out.count("/* AByzFT: randomized scaling"),
+                "freivalds": out.count("/* Freivalds verify"),
+            }[protection]
+            metrics.add("onnx2c Protection markers found", int(expected > 0 or protection == "baseline"), True)
 
             shim_content = self._build_runtime_shim(out)
             shim_artifact = Artifact(f"{base_name}_mlif.c", content=shim_content, fmt=ArtifactFormat.SOURCE)
@@ -555,7 +643,7 @@ int mlonmcu_check() {{
 
             artifacts.append(Artifact("onnx2c_out.log", content=out, fmt=ArtifactFormat.TEXT))
 
-        return {"default": artifacts}, {}
+        return {"default": artifacts}, {"default": metrics}
 
 
 if __name__ == "__main__":
