@@ -53,6 +53,7 @@ class Onnx2CBackend(ONNXBackend):
         "define": {},
         "protection": "baseline",
         "freivalds_checks": 1,
+        "gvfa_checks": 1,
         "abft_weight_checksums_compiletime": True,
         "sanitize_legacy_broadcast_attrs": True,
         "sanitized_model_out": None,
@@ -111,6 +112,10 @@ class Onnx2CBackend(ONNXBackend):
     @property
     def freivalds_checks(self):
         return int(self.config["freivalds_checks"])
+
+    @property
+    def gvfa_checks(self):
+        return int(self.config["gvfa_checks"])
 
     @property
     def abft_weight_checksums_compiletime(self):
@@ -558,9 +563,14 @@ int mlonmcu_check() {{
                     raise RuntimeError("onnx2c.freivalds_checks must be >= 1")
                 args.append("--freivalds-gemm")
                 args.extend(["--freivalds-checks", str(self.freivalds_checks)])
+            elif protection == "gvfa":
+                if self.gvfa_checks < 1:
+                    raise RuntimeError("onnx2c.gvfa_checks must be >= 1")
+                args.append("--gvfa-gemm")
+                args.extend(["--gvfa-checks", str(self.gvfa_checks)])
             else:
                 raise RuntimeError(
-                    "Unsupported onnx2c.protection value. Supported: baseline, abft, abyzft, freivalds"
+                    "Unsupported onnx2c.protection value. Supported: baseline, abft, abyzft, freivalds, gvfa"
                 )
 
             if self.abft_weight_checksums_compiletime:
@@ -608,6 +618,7 @@ int mlonmcu_check() {{
             metrics.add("onnx2c QLinearConv im2col blocks", out.count("/* QLinearConv (im2col + dot-product) */"), True)
             metrics.add("onnx2c ABFT verify blocks", out.count("/* ABFT verify"), True)
             metrics.add("onnx2c Freivalds verify blocks", out.count("/* Freivalds verify"), True)
+            metrics.add("onnx2c GVFA verify blocks", out.count("/* GVFA verify"), True)
             metrics.add("onnx2c AByzFT scaling blocks", out.count("/* AByzFT: randomized scaling"), True)
             metrics.add("onnx2c Tampering increment sites", out.count("TAMPERING_DETECTIONS++"), True)
             metrics.add("onnx2c Protection mode", repr(protection), True)
@@ -616,6 +627,7 @@ int mlonmcu_check() {{
                 "abft": out.count("/* ABFT verify"),
                 "abyzft": out.count("/* AByzFT: randomized scaling"),
                 "freivalds": out.count("/* Freivalds verify"),
+                "gvfa": out.count("/* GVFA verify"),
             }[protection]
             metrics.add("onnx2c Protection markers found", int(expected > 0 or protection == "baseline"), True)
 
