@@ -20,6 +20,8 @@
 
 import shutil
 import multiprocessing
+import subprocess
+import sys
 
 from pathlib import Path
 
@@ -123,7 +125,29 @@ def build_iree(context: MlonMcuContext, params=None, rebuild=False, verbose=Fals
             "-DIREE_HAL_DRIVER_VULKAN=OFF",
             "-DIREE_TARGET_BACKEND_METAL_SPIRV=OFF",
             "-DIREE_BUILD_PYTHON_BINDINGS=ON",
+            # Ensure MLIR configures Python build deps itself when Python bindings are enabled.
+            "-DMLIR_DISABLE_CONFIGURE_PYTHON_DEV_PACKAGES=OFF",
+            "-DMLIR_ENABLE_BINDINGS_PYTHON=ON",
+            f"-DPython3_EXECUTABLE={sys.executable}",
+            f"-DPython_EXECUTABLE={sys.executable}",
         ]
+        # Some IREE revisions expect pybind11 to be provided as an external CMake package.
+        # Resolve pybind11_DIR from the currently active Python environment.
+        try:
+            pybind11_cmake_dir = (
+                subprocess.check_output(
+                    [sys.executable, "-m", "pybind11", "--cmakedir"],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                .strip()
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "IREE Python bindings require pybind11, but it is not available in the active Python environment. "
+                "Install it with: python -m pip install pybind11"
+            ) from exc
+        iree_cmake_args.append(f"-Dpybind11_DIR={pybind11_cmake_dir}")
         cmake_exe = context.cache["cmake.exe"]
         utils.cmake(
             ireeSrcDir,
@@ -134,7 +158,7 @@ def build_iree(context: MlonMcuContext, params=None, rebuild=False, verbose=Fals
             live=verbose,
             cmake_exe=cmake_exe,
         )
-        utils.make(cwd=ireeBuildDir, threads=threads, use_ninja=ninja, live=verbose)
+        utils.make(cwd=ireeBuildDir, threads=min(threads, 2), use_ninja=ninja, live=verbose)
         utils.make("mlir-opt", cwd=ireeBuildDir, threads=threads, use_ninja=ninja, live=verbose)
     context.cache["iree.build_dir"] = ireeBuildDir
     context.cache["iree.install_dir"] = ireeInstallDir

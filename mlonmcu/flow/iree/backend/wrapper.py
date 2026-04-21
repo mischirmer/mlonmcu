@@ -71,6 +71,7 @@ def getIOSetupCode(in_tensors, out_tensors, use_emitc: bool = False):
         shape = [x if x is not None else 1 for x in shape]
         shape_str = "{" + ", ".join(map(str, shape)) + "}"
         dtype = in_tensor.dtype
+        size = in_tensor.size
         hal_element_type = lookup_hal_element_type[dtype]
         ret += f"""
     iree_hal_dim_t shape{i}[{len(shape)}] = {shape_str};  // TODO: fixed size?
@@ -82,7 +83,7 @@ def getIOSetupCode(in_tensors, out_tensors, use_emitc: bool = False):
             .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
             .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
         }},
-        iree_make_const_byte_span(inputs[{i}], sizeof(*inputs[{i}])), &arg{i}_buffer_view));
+        iree_make_const_byte_span(inputs[{i}], {size}), &arg{i}_buffer_view));
 """
     if not use_emitc:
         ret += f"""
@@ -118,6 +119,7 @@ def getIOSetupCode(in_tensors, out_tensors, use_emitc: bool = False):
 def getCopyOutputsCode(out_tensors):
     """Wrapper util for generating code to copy outputs."""
     assert len(out_tensors) == 1
+    out_size = out_tensors[0].size
     ret = """
   iree_hal_buffer_view_t *ret_buffer_view =
       iree_vm_list_get_buffer_view_assign(outputs_, 0);
@@ -130,7 +132,7 @@ def getCopyOutputsCode(out_tensors):
   // Read back the results and ensure we got the right values.
   IREE_RETURN_IF_ERROR(iree_hal_device_transfer_d2h(
       device, iree_hal_buffer_view_buffer(ret_buffer_view), 0, outputs[0],
-      sizeof(*outputs[0]), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+      """ + str(out_size) + """, IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
       iree_infinite_timeout()));
 """
     return ret
