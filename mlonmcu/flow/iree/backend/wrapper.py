@@ -138,7 +138,9 @@ def getCopyOutputsCode(out_tensors):
     return ret
 
 
-def generate_utils(identifier: str, use_emitc: bool, vmvx: bool, iree_version: Optional[str] = None):
+def generate_utils(
+    identifier: str, use_emitc: bool, vmvx: bool, iree_version: Optional[str] = None, embed_data: bool = True
+):
     """Generate IREE wrapper code (utils)."""
     major, minor = parse_iree_version(iree_version)
     new = major > 4 or (major == 3 and minor >= 10)
@@ -210,7 +212,65 @@ iree_status_t create_module(iree_vm_instance_t* instance,
 }
 """
     )
-    utils_ = utils_vmvx if vmvx else (utils_emitc if use_emitc else utils_bytecode)
+    utils_external_file = (
+        """
+#include <stdio.h>
+
+#include "iree/base/api.h"
+#include "iree/vm/bytecode/module.h"
+
+// A function to create the bytecode module from an external VMFB file.
+iree_status_t create_module(iree_vm_instance_t* instance,
+                            iree_vm_module_t** out_module) {
+  FILE* f = fopen(\""""
+        + identifier
+        + """.vmfb\", \"rb\");
+  if (!f) {
+    return iree_make_status(IREE_STATUS_NOT_FOUND, \"Failed to open """
+        + identifier
+        + """.vmfb\");
+  }
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return iree_make_status(IREE_STATUS_UNKNOWN, \"Failed to seek VMFB file\");
+  }
+  long size_long = ftell(f);
+  if (size_long < 0) {
+    fclose(f);
+    return iree_make_status(IREE_STATUS_UNKNOWN, \"Failed to get VMFB file size\");
+  }
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    fclose(f);
+    return iree_make_status(IREE_STATUS_UNKNOWN, \"Failed to rewind VMFB file\");
+  }
+  iree_host_size_t size = (iree_host_size_t)size_long;
+  uint8_t* data = NULL;
+  iree_status_t status = iree_allocator_malloc(iree_allocator_system(), size, (void**)&data);
+  if (!iree_status_is_ok(status)) {
+    fclose(f);
+    return status;
+  }
+  size_t read_count = fread(data, 1, (size_t)size, f);
+  fclose(f);
+  if (read_count != (size_t)size) {
+    iree_allocator_free(iree_allocator_system(), data);
+    return iree_make_status(IREE_STATUS_DATA_LOSS, \"Failed to read full VMFB file\");
+  }
+  iree_const_byte_span_t module_data = iree_make_const_byte_span(data, size);
+  return iree_vm_bytecode_module_create(
+      instance, """
+        + ("IREE_VM_BYTECODE_MODULE_FLAG_NONE, " if new else "")
+        + """module_data, iree_allocator_system(),
+      iree_vm_instance_allocator(instance), out_module);
+}
+"""
+    )
+    if use_emitc:
+        utils_ = utils_emitc
+    elif embed_data:
+        utils_ = utils_vmvx if vmvx else utils_bytecode
+    else:
+        utils_ = utils_external_file
     return utils_
 
 
@@ -663,6 +723,7 @@ def generate_iree_wrapper(
     iree_version: Optional[str] = None,
     enable_abft: bool = False,
     linked_identifier: Optional[str] = None,
+    embed_data: bool = True,
 ):
     """Generate IREE wrapper codes (source, header, device_sync, utils)."""
 
@@ -682,5 +743,5 @@ def generate_iree_wrapper(
     )
     header = generate_header()
     sync = generate_sync(identifier, identifier2, vmvx)
-    utils_ = generate_utils(identifier, use_emitc, vmvx, iree_version=iree_version)
+    utils_ = generate_utils(identifier, use_emitc, vmvx, iree_version=iree_version, embed_data=embed_data)
     return wrapper, header, sync, utils_

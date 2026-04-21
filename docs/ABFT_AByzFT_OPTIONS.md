@@ -25,6 +25,7 @@ Use backend-prefixed config keys, for example:
 | `abft_enable_matmul_tiling` | bool | `true` | Enables transform-spec tiling wiring in backend compile pipeline. |
 | `abft_inject_fault` | bool | `false` | Enables synthetic fault injection. |
 | `abft_inject_fault_delta` | int | `1` | Additive fault delta. |
+| `abft_inject_fault_layer` | int | `-1` | Target layer ordinal for fault injection (`-1` = inject all layers). |
 | `abft_inject_fault_pattern` | string | `single_point` | `single_point`, `trivial`, `checkered`. |
 
 ## AByzFT Options
@@ -34,6 +35,7 @@ Use backend-prefixed config keys, for example:
 | `abyzft_enable_analysis` | bool | `true` | Analysis toggle for AByzFT mode (mapped via shared ABFT analysis control path). |
 | `abyzft_inject_fault` | bool | `false` | Enables synthetic fault injection. |
 | `abyzft_inject_fault_delta` | int | `1` | Additive fault delta. |
+| `abyzft_inject_fault_layer` | int | `-1` | Target layer ordinal for fault injection (`-1` = inject all layers). |
 | `abyzft_inject_fault_pattern` | string | `single_point` | `single_point`, `trivial`, `checkered`. |
 | `abyzft_scale_sampling_mode` | int | `1` | `1`, `2`, `3` (type-aware behavior, see below). |
 | `abyzft_float_disjoint_min_abs` | float | `0.5` | Float mode 1 lower abs bound. |

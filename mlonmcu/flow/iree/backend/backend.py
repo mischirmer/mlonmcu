@@ -19,6 +19,7 @@
 """Generic IREEBackend implementation."""
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Tuple, Optional
@@ -134,10 +135,12 @@ class IREEBackend(Backend):
         "abft_enable_fuc": False,
         "abft_inject_fault": False,
         "abft_inject_fault_delta": 1,
+        "abft_inject_fault_layer": -1,
         "abft_inject_fault_pattern": "single_point",
         "abyzft_enable_analysis": True,
         "abyzft_inject_fault": False,
         "abyzft_inject_fault_delta": 1,
+        "abyzft_inject_fault_layer": -1,
         "abyzft_inject_fault_pattern": "single_point",
         "abyzft_scale_sampling_mode": 1,
         "abyzft_float_disjoint_min_abs": 0.5,
@@ -165,6 +168,7 @@ class IREEBackend(Backend):
         "target_vector_width": None,
         "target_scalable_vectorization": None,
         "loop_unroll": True,
+        "embed_vmfb_limit": 100000000,
     }
 
     OPTIONAL = {"iree.version", "iree.build_dir"}
@@ -367,6 +371,10 @@ class IREEBackend(Backend):
         ]
 
     @property
+    def embed_vmfb_limit(self):
+        return int(self.config["embed_vmfb_limit"])
+
+    @property
     def strip_assertions(self):
         return str2bool(self.config["strip_assertions"], allow_none=True)
 
@@ -449,6 +457,12 @@ class IREEBackend(Backend):
         return int(self.config["abft_inject_fault_delta"])
 
     @property
+    def abft_inject_fault_layer(self):
+        if self.compiler_mode == "abyzft" and "abyzft_inject_fault_layer" in self.config:
+            return int(self.config["abyzft_inject_fault_layer"])
+        return int(self.config["abft_inject_fault_layer"])
+
+    @property
     def abft_inject_fault_pattern(self):
         if self.compiler_mode == "abyzft" and "abyzft_inject_fault_pattern" in self.config:
             value = self.config["abyzft_inject_fault_pattern"]
@@ -500,24 +514,38 @@ class IREEBackend(Backend):
     def abyzft_int_bits_max(self):
         return int(self.config["abyzft_int_bits_max"])
 
+    def get_instrumentation_pass_pipeline(self):
+        if self.compiler_mode == "abft":
+            return "builtin.module(abft-specialize-batch-dim,iree-preprocessing-convert-conv2d-to-img2col,func.func(abft-insert-ones))"
+        if self.compiler_mode == "abyzft":
+            # AByzFT pass is registered on builtin.module, so it must not be nested under func.func.
+            # Keep parity with ABFT preprocessing: specialize batch dim first to
+            # unlock conv2d->img2col conversion for dynamic-batch models.
+            return "builtin.module(abft-specialize-batch-dim,iree-preprocessing-convert-conv2d-to-img2col,abyzft-insert-scale-descal)"
+        if self.compiler_mode in ["freivald", "freivalds"]:
+            return "builtin.module(iree-preprocessing-convert-conv2d-to-img2col,func.func(iree-global-opt-quantized-matmul-to-matmul,freivalds-insert-ones))"
+        return None
+
     def get_iree_opt_instrument_args(self):
         if self.compiler_mode == "baseline":
             return []
         if self.compiler_mode == "abft":
             return [
                 "--iree-plugin=abft_pass",
-                "--pass-pipeline=builtin.module(func.func(iree-preprocessing-convert-conv2d-to-img2col,abft-insert-ones))",
+                f"--pass-pipeline={self.get_instrumentation_pass_pipeline()}",
                 *(["--abft-enable-fuc"] if self.abft_enable_fuc else []),
                 *(["--abft-enable-analysis-log=false"] if not self.abft_enable_analysis else []),
                 *(["--abft-inject-fault"] if self.abft_inject_fault else []),
                 *([f"--abft-inject-fault-delta={self.abft_inject_fault_delta}"] if self.abft_inject_fault else []),
+                *([f"--abft-inject-fault-layer={self.abft_inject_fault_layer}"] if self.abft_inject_fault else []),
                 *([f"--abft-inject-fault-pattern={self.abft_inject_fault_pattern}"] if self.abft_inject_fault else []),
                 "--mlir-disable-threading",
             ]
         if self.compiler_mode == "abyzft":
             return [
+                "--iree-plugin=abft_pass",
                 "--iree-plugin=abyzft_pass",
-                "--pass-pipeline=builtin.module(func.func(iree-preprocessing-convert-conv2d-to-img2col),abyzft-insert-scale-descal)",
+                f"--pass-pipeline={self.get_instrumentation_pass_pipeline()}",
                 f"--abyzft-scale-sampling-mode={self.abyzft_scale_sampling_mode}",
                 f"--abyzft-float-disjoint-min-abs={self.abyzft_float_disjoint_min_abs}",
                 f"--abyzft-float-disjoint-max-abs={self.abyzft_float_disjoint_max_abs}",
@@ -530,13 +558,14 @@ class IREEBackend(Backend):
                 f"--abyzft-int-bits-max={self.abyzft_int_bits_max}",
                 *(["--abyzft-inject-fault"] if self.abft_inject_fault else []),
                 *([f"--abyzft-inject-fault-delta={self.abft_inject_fault_delta}"] if self.abft_inject_fault else []),
+                *([f"--abyzft-inject-fault-layer={self.abft_inject_fault_layer}"] if self.abft_inject_fault else []),
                 *([f"--abyzft-inject-fault-pattern={self.abft_inject_fault_pattern}"] if self.abft_inject_fault else []),
                 "--mlir-disable-threading",
             ]
         if self.compiler_mode in ["freivald", "freivalds"]:
             return [
                 "--iree-plugin=freivalds_pass",
-                "--pass-pipeline=builtin.module(func.func(iree-preprocessing-convert-conv2d-to-img2col,iree-global-opt-quantized-matmul-to-matmul),func.func(freivalds-insert-ones))",
+                f"--pass-pipeline={self.get_instrumentation_pass_pipeline()}",
                 f"--freivalds-scaling-mode={self.freivalds_scaling_mode}",
                 f"--freivalds-num-checks={self.freivalds_num_checks}",
                 *(["--freivalds-inject-fault"] if self.abft_inject_fault else []),
@@ -563,11 +592,10 @@ class IREEBackend(Backend):
                 *(["--abft-enable-analysis-log=false"] if not self.abft_enable_analysis else []),
                 *(["--abft-inject-fault"] if self.abft_inject_fault else []),
                 *([f"--abft-inject-fault-delta={self.abft_inject_fault_delta}"] if self.abft_inject_fault else []),
+                *([f"--abft-inject-fault-layer={self.abft_inject_fault_layer}"] if self.abft_inject_fault else []),
                 *([f"--abft-inject-fault-pattern={self.abft_inject_fault_pattern}"] if self.abft_inject_fault else []),
             ]
-            preprocessing_pipeline = (
-                "builtin.module(func.func(iree-preprocessing-convert-conv2d-to-img2col,abft-insert-ones))"
-            )
+            preprocessing_pipeline = self.get_instrumentation_pass_pipeline()
         elif self.compiler_mode == "abyzft":
             mode_args += [
                 "--iree-plugin=abyzft_pass",
@@ -583,11 +611,10 @@ class IREEBackend(Backend):
                 f"--abyzft-int-bits-max={self.abyzft_int_bits_max}",
                 *(["--abyzft-inject-fault"] if self.abft_inject_fault else []),
                 *([f"--abyzft-inject-fault-delta={self.abft_inject_fault_delta}"] if self.abft_inject_fault else []),
+                *([f"--abyzft-inject-fault-layer={self.abft_inject_fault_layer}"] if self.abft_inject_fault else []),
                 *([f"--abyzft-inject-fault-pattern={self.abft_inject_fault_pattern}"] if self.abft_inject_fault else []),
             ]
-            preprocessing_pipeline = (
-                "builtin.module(func.func(iree-preprocessing-convert-conv2d-to-img2col),abyzft-insert-scale-descal)"
-            )
+            preprocessing_pipeline = self.get_instrumentation_pass_pipeline()
         elif self.compiler_mode in ["freivald", "freivalds"]:
             mode_args += [
                 "--iree-plugin=freivalds_pass",
@@ -598,9 +625,7 @@ class IREEBackend(Backend):
                 *([f"--freivalds-inject-fault-delta={self.abft_inject_fault_delta}"] if self.abft_inject_fault else []),
                 *([f"--freivalds-inject-fault-pattern={self.abft_inject_fault_pattern}"] if self.abft_inject_fault else []),
             ]
-            preprocessing_pipeline = (
-                "builtin.module(func.func(iree-preprocessing-convert-conv2d-to-img2col,iree-global-opt-quantized-matmul-to-matmul),func.func(freivalds-insert-ones))"
-            )
+            preprocessing_pipeline = self.get_instrumentation_pass_pipeline()
         else:
             raise RuntimeError(f"Unhandled compiler mode: {self.compiler_mode}")
 
@@ -609,7 +634,7 @@ class IREEBackend(Backend):
                 f"--iree-preprocessing-pass-pipeline={preprocessing_pipeline}",
             ]
 
-        if self.abft_enable_matmul_tiling:
+        if self.abft_enable_matmul_tiling and self.hal_backend == "llvm-cpu":
             transform_lib = self.get_matmul_transform_lib()
             if transform_lib.is_file():
                 mode_args += [
@@ -617,6 +642,8 @@ class IREEBackend(Backend):
                 ]
             else:
                 logger.warning("ABFT matmul tiling enabled but transform spec is missing: %s", transform_lib)
+        elif self.abft_enable_matmul_tiling and self.hal_backend in ["vmvx", "vmvx-inline"]:
+            logger.warning("Ignoring abft_enable_matmul_tiling for backend '%s'", self.hal_backend)
         mode_args += ["--mlir-disable-threading"]
         return mode_args
 
@@ -825,6 +852,41 @@ class IREEBackend(Backend):
         text = text.replace("util.func", "func.func")
         text = text.replace("util.call", "func.call")
         text = text.replace("util.return", "func.return")
+        Path(output_mlir_path).write_text(text)
+
+    def specialize_leading_batch_dim_to_one(self, input_mlir_path, output_mlir_path):
+        text = Path(input_mlir_path).read_text()
+        # Specialize rank>=2 tensors with dynamic leading dim:
+        #   tensor<?xA...xT> -> tensor<1xA...xT>
+        text = re.sub(r"tensor<\?x([^>]*x[^>]+)>", r"tensor<1x\1>", text)
+        # Also specialize rank-1 tensors that represent leading dynamic dims:
+        #   tensor<?xT> -> tensor<1xT>
+        text = re.sub(r"tensor<\?x([^x>]+)>", r"tensor<1x\1>", text)
+        # Keep tensor.empty operand counts consistent after specialization:
+        # if result type has no dynamic dims left, tensor.empty must have no
+        # dynamic size operands.
+        def _fix_empty(match):
+            ty = match.group(1)
+            if "?" in ty:
+                return match.group(0)
+            return f"tensor.empty() : tensor<{ty}>"
+
+        text = re.sub(r"tensor\.empty\([^)]*\)\s*:\s*tensor<([^>]+)>", _fix_empty, text)
+        # Also handle the quoted-op form emitted in some IR dumps:
+        #   "tensor.empty"(%d0, ...) : (index, ...) -> tensor<...>
+        # If the result type is fully static, drop dynamic operands and
+        # operand type list to keep the IR verifier happy.
+        def _fix_quoted_empty(match):
+            ty = match.group(1)
+            if "?" in ty:
+                return match.group(0)
+            return f'"tensor.empty"() : () -> tensor<{ty}>'
+
+        text = re.sub(
+            r'"tensor\.empty"\([^)]*\)\s*:\s*\([^)]*\)\s*->\s*tensor<([^>]+)>',
+            _fix_quoted_empty,
+            text,
+        )
         Path(output_mlir_path).write_text(text)
 
     def get_matmul_transform_lib(self):
@@ -1130,25 +1192,33 @@ class IREEBackend(Backend):
                 )
                 impl_path = out_dir / f"{self.identifier}.c"
                 header_path = out_dir / f"{self.identifier}.h"
-                out += self.invoke_iree_c_embed_data(out_path, impl_path, header_path, cwd=temp_dir)
-                with open(impl_path, "r") as f:
-                    impl_content = f.read()
-                with open(header_path, "r") as f:
-                    header_content = f.read()
-                artifacts.append(
-                    Artifact(
-                        impl_path.name,
-                        content=impl_content,
-                        fmt=ArtifactFormat.SOURCE,
+                use_embedded_vmfb = out_path.stat().st_size <= self.embed_vmfb_limit
+                if use_embedded_vmfb:
+                    out += self.invoke_iree_c_embed_data(out_path, impl_path, header_path, cwd=temp_dir)
+                    with open(impl_path, "r") as f:
+                        impl_content = f.read()
+                    with open(header_path, "r") as f:
+                        header_content = f.read()
+                    artifacts.append(
+                        Artifact(
+                            impl_path.name,
+                            content=impl_content,
+                            fmt=ArtifactFormat.SOURCE,
+                        )
                     )
-                )
-                artifacts.append(
-                    Artifact(
-                        header_path.name,
-                        content=header_content,
-                        fmt=ArtifactFormat.SOURCE,
+                    artifacts.append(
+                        Artifact(
+                            header_path.name,
+                            content=header_content,
+                            fmt=ArtifactFormat.SOURCE,
+                        )
                     )
-                )
+                else:
+                    logger.warning(
+                        "VMFB size (%d bytes) exceeds embed_vmfb_limit (%d bytes); skipping C embedding and using file loading",
+                        out_path.stat().st_size,
+                        self.embed_vmfb_limit,
+                    )
             # If analysis imports were stripped from instrumented MLIR, the
             # wrapper must not wire the abft_analysis runtime module.
             analysis_calls_stripped = (
@@ -1163,6 +1233,7 @@ class IREEBackend(Backend):
                 iree_version=self.iree_version,
                 enable_abft=self.enable_abft_runtime_module(analysis_calls_stripped),
                 linked_identifier=Path(model_path).stem,
+                embed_data=(self.output_format != "vm-bytecode") or use_embedded_vmfb,
             )
             artifacts.append(
                 Artifact(
@@ -1210,6 +1281,12 @@ class IREEBackend(Backend):
 
     def get_platform_defs(self, platform):
         ret = super().get_platform_defs(platform)
+        # MLIF only provides a single IREE backend cmake module
+        # (`cmake/backends/ireellvmc.cmake`) which is backend-agnostic and
+        # configures the common IREE framework plumbing. Keep the concrete HAL
+        # selection via IREE_* flags below.
+        if platform.startswith("mlif"):
+            ret["MLONMCU_BACKEND"] = "ireellvmc"
         ret["IREE_EMITC"] = self.use_emitc
         if self.hal_inline and self.hal_backend == "llvm-cpu":
             ret["IREE_LOADER_HAL"] = True
