@@ -471,6 +471,7 @@ class Onnx2CBackend(ONNXBackend):
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 {chr(10).join(arg_decls)}
 
